@@ -33,6 +33,14 @@
  * 
  */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+
+
 
 
 #include <time.h>
@@ -53,6 +61,7 @@
 #define INTERVAL		5000	// msec between two updates
 
 #define MAKELOG         1     // log file batteryLog in home directory (0 = no log file)
+#define I2C_SLAVE	0x0703
 
 cairo_surface_t *surface;
 gint width;
@@ -69,6 +78,72 @@ FILE *logFile;
 int last_capacity, last_state, last_time;
 
 int iconSize;
+
+int i2c_handle=0;
+char* device; //I2C bus device
+int slave_addr=0x10; //slave(battery controller) address
+int bus_delay=2000; //delay after reading/writing, in useconds.
+char* buf[10]; //read-write buffer for I2C operations
+
+
+//Connect to I2C bus and set slave address
+int i2c_connect(const char *device, int slave_addr)
+{
+	i2c_handle=open(device, O_RDWR);
+	if(i2c_handle < 0)
+	{
+		printf("ERROR: Unable to open I2C bus device! Errno: %d Errstr: %s \n",errno, strerror(errno));
+		return -1;
+	}
+	usleep(bus_delay);
+	if (ioctl(i2c_handle,I2C_SLAVE,slave_addr)<0)
+	{
+		printf("ERROR: Unable to set slave address! Errno: %d Errstr: %s \n", errno, strerror(errno));
+		return -1;
+	}
+	usleep(bus_delay);
+	//debug
+	printf("I2C device opened. Handle: %d \n", i2c_handle);
+	return 0;
+}
+
+//read from device
+//len - is number of bytes to read, can be 1 - for read single byte, or 2 for read word.
+char* i2c_read(int i2c_register,int len)
+{
+	int res;
+	//Check len
+	if(len<1)
+	{
+		len=1;
+	}
+	
+	if(len>2)
+	{
+		len=2;
+	}
+	//Write register address to device
+	res=write(i2c_handle,&i2c_register,1);
+	if(res<0)
+	{
+		printf("ERROR: Error writing to device! Errno: %d Errstr: %s \n", errno, strerror(errno));
+	}
+	usleep(bus_delay);
+	printf("Writing to device finished. Wrote %d bytes. \n",res);
+	res = 0;
+	//Read data from device
+	res=read(i2c_handle,&buf,len);
+	if(res<0)
+	{
+		printf("ERROR: Error reading from device! Errno: %d Errstr: %s \n", errno, strerror(errno));
+	}
+   usleep(bus_delay);
+	//debug
+	printf("Reading from device finished. Got %d bytes. \n",res);
+	
+	return *buf;
+}
+
 
 void printLogEntry(int capacity, char* state, char* timeStr) {
 	time_t rawtime;
@@ -101,36 +176,42 @@ static gboolean timer_event(GtkWidget *widget)
 	
 	int chargingState;
 	char battdata[2048];
+	int raw_current=0,current=0;
+	
+	
 	
 	// stop timer in case of tc_loop taking too long
 	
 	g_source_remove(global_timeout_ref);
 	
-	// run /usr/bin/pt-battery and extract current charge and state from output
-	
-	battskript = popen("/usr/bin/pt-battery","r");
-	if (battskript == NULL) {
-		printf("Failed to run pt-battery\n");
-		exit (1);
-	}
-	
-	chargingState = -1;
-	capacity = -1;
-	time = -1;
-
-    	while (fgets(battdata, 2047, battskript) != NULL) {
-		sscanf(battdata,"Charging State: %d", &chargingState);
-		sscanf(battdata,"Capacity:%d", &capacity);
-		sscanf(battdata,"Time Remaining:%d", &time);
-	}
-		
-	// printf("Charging State: %d, ", chargingState);
-	// printf("Capacity: %d, ", capacity);
-    
+	//read capacity (SoC)
+	memset(&buf,0,10);
+   i2c_read(0xB4,1);
+   //memcpy(&capacity,&buf,1);
+   capacity=(int)buf[0];
+    //printf("Readed battery SoC: %d \n",buf[0]);
 	if ((capacity > 100) || (capacity < 0))
 		capacity = -1;              // capacity out of limits
 
-	pclose(battskript);
+    printf("Readed battery capacity: %d \n",capacity);
+		//read current      
+      i2c_read(0xB3,2);
+	   memcpy(&raw_current,&buf,2);
+	   raw_current = ((0xFF & raw_current)<<8) | (raw_current>>8) ; //swap bytes
+	   
+	   printf("Readed battery raw current: %d \n",raw_current);
+	   chargingState=2; //default state - externally powered
+	   if(raw_current>32767) //discharging?
+	   {
+	   	chargingState=0;
+	     current=raw_current-65536;
+	   }
+	   else if(raw_current>0){ //charging?
+ 	   	chargingState=1;
+	   	current=raw_current;
+	   }
+		printf("Readed battery current: %d mA \n",current);
+
 	
 	
 	// check whether state or capacity has changed
@@ -276,7 +357,16 @@ int main(int argc, char *argv[])
 	
 	gtk_init(&argc, &argv);
 	
+	device="/dev/i2c-1"; //I2C bus device
+	
 	// open log file
+	
+	if(i2c_connect(device,slave_addr)!=0)
+	{
+		printf("Error connecting to i2c device! \n");
+		return(0);
+	}
+	
 	
 	const char *homedir = getpwuid(getuid())->pw_dir;	
 	char s[255];
@@ -290,21 +380,10 @@ int main(int argc, char *argv[])
 	else
 		logFile = stdout;
 	
-	// check whether pt-battery can be executed
-	
-	battskript = popen("/usr/bin/pt-battery","r");
-	if (battskript == NULL) {
-		printf("Failed to run /usr/bin/pt-battery\n");
-		fprintf(logFile,"Failed to run /usr/bin/pt-battery\n");
-		exit (1);
-	}
-	else		
-		pclose(battskript);
-		
 	// get lxpanel icon size
 	iconSize = -1;
 	strcpy(s, homedir);
-	strcat(s, "/.config/lxpanel/LXDE-pi/panels/panel");
+	strcat(s, "/.config/lxpanel/LXDE/panels/panel");
 	FILE* lxpanel = fopen(s, "r");
 	if (lxpanel == NULL) {
 		printf("Failed to open lxpanel config file %s\n", s);
@@ -371,6 +450,8 @@ int main(int argc, char *argv[])
 	timer_event(MainWindow);
 	
 	gtk_main();
+	
+	 close(i2c_handle);
 	
 	return 0;
 }
